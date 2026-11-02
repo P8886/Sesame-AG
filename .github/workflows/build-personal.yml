@@ -1,0 +1,115 @@
+name: 自用 APK 构建
+run-name: 自用 APK 构建 - ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 源码分支或标签（默认 dev）
+        required: true
+        default: dev
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  ANDROID_PLATFORM: android-37.0
+  ANDROID_BUILD_TOOLS: "37.0.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: 设置构建时区
+        run: sudo timedatectl set-timezone Asia/Shanghai
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: oracle
+          java-version: "17.0.1"
+          architecture: x64
+
+      - name: 设置 Gradle Java 路径
+        run: echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: 配置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: 安装 Android 构建工具
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 编译 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: 使用固定个人证书签名并校验
+        shell: bash
+        env:
+          PERSONAL_SIGNING_KEY: ${{ secrets.PERSONAL_SIGNING_KEY }}
+          PERSONAL_KEYSTORE_PASSWORD: ${{ secrets.PERSONAL_KEYSTORE_PASSWORD }}
+          PERSONAL_SIGNING_CERT_SHA256: ${{ vars.PERSONAL_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          test -n "$PERSONAL_SIGNING_KEY"
+          test -n "$PERSONAL_KEYSTORE_PASSWORD"
+          test -n "$PERSONAL_SIGNING_CERT_SHA256"
+          umask 077
+          keystore_path="${RUNNER_TEMP}/sesame-personal.p12"
+          printf '%s' "$PERSONAL_SIGNING_KEY" | base64 --decode > "$keystore_path"
+          trap 'rm -f "$keystore_path"' EXIT
+          apksigner_path="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          mkdir -p personal-apks
+          shopt -s nullglob
+          apk_files=(app/build/outputs/apk/release/*.apk)
+          test "${#apk_files[@]}" -gt 0
+          for apk_path in "${apk_files[@]}"; do
+            apk_name="$(basename "$apk_path" .apk)-personal.apk"
+            output_path="personal-apks/${apk_name}"
+            "$apksigner_path" sign --ks "$keystore_path" --ks-type PKCS12 --ks-key-alias sesame-personal \
+              --ks-pass env:PERSONAL_KEYSTORE_PASSWORD --key-pass env:PERSONAL_KEYSTORE_PASSWORD \
+              --out "$output_path" "$apk_path"
+            certificate_output="$("$apksigner_path" verify --verbose --print-certs "$output_path")"
+            actual_fingerprint="$(printf '%s\n' "$certificate_output" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')"
+            test "$actual_fingerprint" = "$PERSONAL_SIGNING_CERT_SHA256"
+          done
+          git rev-parse HEAD > personal-apks/SOURCE_COMMIT.txt
+          printf '%s\n' "$PERSONAL_SIGNING_CERT_SHA256" > personal-apks/PERSONAL-SIGNING-CERTIFICATE.txt
+          (cd personal-apks && sha256sum ./*.apk > SHA256SUMS)
+          {
+            echo '### 自用构建完成'
+            echo "- 源码提交：$(git rev-parse HEAD)"
+            echo '- 个人签名构建，不是官方签名包。'
+            echo '- 一加手机选择 app-arm64-v8a-release-personal.apk。'
+            echo '- 在本次运行页面下载 Artifacts，无需解压密码。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 APK（无解压密码）
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sesame-AG-personal-${{ github.run_number }}
+          path: personal-apks/
+          if-no-files-found: error
